@@ -1,44 +1,52 @@
 import streamlit as st
 import rasterio
 from rasterio.warp import reproject, Resampling
-import rasterio.io
+from rasterio.mask import mask
+from rasterio.io import MemoryFile
 import numpy as np
 import matplotlib.pyplot as plt
 import tempfile
 import os
 from io import BytesIO
+import fiona
 
-st.set_page_config(page_title="Curve Number (SCS-CN) Map Generator", layout="wide")
+st.set_page_config(page_title="SCS Curve Number & Retention App", layout="wide")
 
-st.title("Curve Number (SCS-CN) Map Generator")
+st.title("SCS Curve Number (TR-55) & Retention Map Generator")
 
 st.write(
     """
-    **Inputs required**
-    - SOIL raster: OpenLandMap soil texture (USDA textural classes, codes 1–12).
-    - LULC raster: ESA CCI Land Cover (values 0–220).
-
-    **Outputs**
-    - Hydrologic Soil Group (HSG) map (A/B/C/D).
-    - LULC map (CCI codes).
-    - Curve Number (CN) map and downloadable CN GeoTIFF.
+    This app:
+    1. Clips rasters to a **boundary shapefile** (zipped folder),
+    2. Converts **OpenLandMap soil texture** → Hydrologic Soil Groups (HSG A–D),
+    3. Converts **ESA CCI Land Cover** → land-use categories,
+    4. Computes **Curve Number (CN)** using TR-55 (AMC-II),
+    5. Computes **Potential Maximum Retention** S (in **mm**, SI units),
+    6. Generates maps and downloadable GeoTIFFs.
     """
 )
 
-# -------------------------------------------------------------------
-# 1. Upload widgets
-# -------------------------------------------------------------------
+# -------------------------------------------------------
+# 1. Upload inputs
+# -------------------------------------------------------
 soil_file = st.file_uploader(
-    "Upload SOIL raster (GeoTIFF, OpenLandMap soil texture)", type=["tif", "tiff"]
+    "Upload SOIL raster (GeoTIFF, OpenLandMap USDA texture classes 1–12)",
+    type=["tif", "tiff"],
 )
 lulc_file = st.file_uploader(
-    "Upload LULC raster (GeoTIFF, ESA CCI Land Cover)", type=["tif", "tiff"]
+    "Upload LULC raster (GeoTIFF, ESA CCI Land Cover)",
+    type=["tif", "tiff"],
+)
+shp_zip = st.file_uploader(
+    "Upload boundary shapefile as a ZIPPED folder (.zip)",
+    type=["zip"],
 )
 
-# -------------------------------------------------------------------
+# -------------------------------------------------------
 # 2. Mappings
-# -------------------------------------------------------------------
-# OpenLandMap soil texture -> Hydrologic Soil Group (HSG)
+# -------------------------------------------------------
+
+# OpenLandMap soil texture → Hydrologic Soil Group
 soil_to_hsg = {
     12: "A",  # Sand
     11: "A",  # Loamy sand
@@ -58,19 +66,16 @@ soil_to_hsg = {
 }
 hsg_letter_to_id = {"A": 1, "B": 2, "C": 3, "D": 4}
 
-# ESA CCI LULC → broader SCS land-use categories
-# Based on your legend PDF.
+# ESA CCI LULC → meaningful categories
 cci_to_category = {
-    0:  None,              # No data
-    10: "cropland",        # Cropland, rainfed
-    11: "cropland",        # Herbaceous cover (cropland)
-    12: "cropland",        # Tree or shrub cover (cropland)
-    20: "cropland",        # Cropland, irrigated or post-flooding
+    0:  None,             # No data
+    10: "cropland",
+    11: "cropland",
+    12: "cropland",
+    20: "cropland",
+    30: "mosaic_cropland",
+    40: "mosaic_cropland",
 
-    30: "mosaic_cropland", # Mosaic cropland / natural veg
-    40: "mosaic_cropland", # Mosaic nat. veg / cropland
-
-    # Tree cover classes (broadleaf & needleleaf, all decid/evergreen)
     50: "forest",
     60: "forest",
     61: "forest",
@@ -82,66 +87,63 @@ cci_to_category = {
     81: "forest",
     82: "forest",
     90: "forest",
+    100:"forest",
 
-    # Mosaics dominated by woody cover or herbaceous cover
-    100: "forest",         # Mosaic tree & shrub / herbaceous
-    110: "grassland",      # Mosaic herbaceous / tree & shrub
+    110:"grassland",
+    120:"shrubland",
+    121:"shrubland",
+    122:"shrubland",
+    130:"grassland",
 
-    # Shrub & grass
-    120: "shrubland",
-    121: "shrubland",
-    122: "shrubland",
-    130: "grassland",
+    140:"barren",
+    150:"barren",
+    151:"barren",
+    152:"barren",
+    153:"barren",
+    200:"barren",
+    201:"barren",
+    202:"barren",
+    220:"barren",
 
-    # Lichens/mosses, sparse veg, bare, snow/ice → treat as "barren"
-    140: "barren",
-    150: "barren",
-    151: "barren",
-    152: "barren",
-    153: "barren",
-    200: "barren",
-    201: "barren",
-    202: "barren",
-    220: "barren",         # Permanent snow & ice
+    160:"water",
+    170:"water",
+    180:"water",
+    210:"water",
 
-    # Flooded / wetlands and water → treat as "water" (high CN)
-    160: "water",
-    170: "water",
-    180: "water",
-    210: "water",
-
-    # Urban
-    190: "urban",
+    190:"urban",
 }
 
-
-# CN lookup table (AMC-II) from TR-55 tables
+# TR-55 CN table (AMC-II) – SI units for retention (mm)
 cn_table = {
     "cropland":        {"A": 64, "B": 75, "C": 82, "D": 85},  # Row crops (good)
     "mosaic_cropland": {"A": 60, "B": 72, "C": 80, "D": 84},  # Small grain (good)
     "grassland":       {"A": 39, "B": 61, "C": 74, "D": 80},  # Pasture/grassland good
     "shrubland":       {"A": 35, "B": 56, "C": 70, "D": 77},  # Brush fair
     "forest":          {"A": 30, "B": 55, "C": 70, "D": 77},  # Woods good
-    "barren":          {"A": 72, "B": 82, "C": 87, "D": 89},  # Dirt (right-of-way)
-    "urban":           {"A": 98, "B": 98, "C": 98, "D": 98},  # Paved/roofs
-    "water":           {"A": 100, "B": 100, "C": 100, "D": 100},  # Open water
+    "barren":          {"A": 72, "B": 82, "C": 87, "D": 89},  # Dirt / bare
+    "urban":           {"A": 98, "B": 98, "C": 98, "D": 98},  # Fully paved
+    "water":           {"A":100, "B":100, "C":100, "D":100},  # Open water
 }
 
-
-# -------------------------------------------------------------------
+# -------------------------------------------------------
 # 3. Helper functions
-# -------------------------------------------------------------------
+# -------------------------------------------------------
 def save_to_temp(uploaded_file, suffix=".tif"):
-    """Save uploaded file to a temporary GeoTIFF and return its path."""
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.write(uploaded_file.read())
     tmp.flush()
     tmp.close()
     return tmp.name
 
+def save_zip(uploaded_file):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    tmp.write(uploaded_file.read())
+    tmp.flush()
+    tmp.close()
+    return tmp.name
 
 def reproject_soil_to_lulc(soil_path, lulc_path):
-    """Reproject soil raster to the grid (extent/resolution/CRS) of the LULC raster."""
+    """Reproject soil raster to full LULC grid."""
     with rasterio.open(soil_path) as soil_src, rasterio.open(lulc_path) as lulc_src:
         soil = soil_src.read(1)
         soil_nodata = soil_src.nodata if soil_src.nodata is not None else 0
@@ -156,126 +158,219 @@ def reproject_soil_to_lulc(soil_path, lulc_path):
             src_crs=soil_src.crs,
             dst_transform=lulc_src.transform,
             dst_crs=lulc_src.crs,
-            resampling=Resampling.nearest,
+            resampling=Resampling.nearest
         )
 
         return soil_reproj, soil_nodata, lulc_src.profile
 
-
-def soil_to_hsg_id(soil_reproj, soil_nodata):
-    """Convert soil texture code raster → HSG ID raster (1=A,2=B,3=C,4=D)."""
-    hsg_id = np.full_like(soil_reproj, -1, dtype=np.int16)
-    valid = soil_reproj != soil_nodata
+def soil_to_hsg_id(soil_arr, soil_nodata):
+    hsg_id = np.full_like(soil_arr, -1, dtype=np.int16)
+    valid = soil_arr != soil_nodata
     for code, letter in soil_to_hsg.items():
-        mask = (soil_reproj == code) & valid
+        mask = (soil_arr == code) & valid
         hsg_id[mask] = hsg_letter_to_id[letter]
     return hsg_id
 
+def classify_lulc_categories(lulc_arr):
+    """Map LULC codes to category IDs and return array + mapping."""
+    cat_arr = np.full(lulc_arr.shape, -1, dtype=np.int16)
+    codes = np.unique(lulc_arr)
+    cats = []
+    for code in codes:
+        cat = cci_to_category.get(int(code))
+        if cat is not None:
+            cats.append(cat)
+    cats = sorted(set(cats))
+    cat_to_id = {c: i for i, c in enumerate(cats)}
+    for code in codes:
+        cat = cci_to_category.get(int(code))
+        if cat is None:
+            continue
+        mask = (lulc_arr == code)
+        cat_arr[mask] = cat_to_id[cat]
+    return cat_arr, cat_to_id
 
-def compute_cn(soil_reproj, soil_nodata, lulc_path):
-    """Compute CN, and return CN array, LULC array, HSG array, profile and unknown LULC codes."""
-    with rasterio.open(lulc_path) as lulc_src:
-        lulc = lulc_src.read(1)
-        lulc_nodata = lulc_src.nodata if lulc_src.nodata is not None else 0
-        profile = lulc_src.profile
-
-    hsg_id = soil_to_hsg_id(soil_reproj, soil_nodata)
+def compute_cn_and_retention(soil_arr, soil_nodata, lulc_arr, profile):
+    """Compute HSG, CN and S (mm) from arrays."""
+    hsg_id = soil_to_hsg_id(soil_arr, soil_nodata)
     cn_nodata = -9999.0
-    cn = np.full_like(lulc, cn_nodata, dtype=np.float32)
+    cn = np.full_like(lulc_arr, cn_nodata, dtype=np.float32)
 
     id_to_letter = {v: k for k, v in hsg_letter_to_id.items()}
+    unl = np.unique(lulc_arr)
+    unknown_codes = []
 
-    unique_lulc = np.unique(lulc[lulc != lulc_nodata])
-    unknown_lulc_codes = []
-
-    for lc in unique_lulc:
-        category = cci_to_category.get(int(lc))
-        if category is None:
-            unknown_lulc_codes.append(int(lc))
+    for lc_val in unl:
+        cat = cci_to_category.get(int(lc_val))
+        if cat is None:
+            unknown_codes.append(int(lc_val))
             continue
-
-        lc_mask = lulc == lc
-
-        for hsg_code, hsg_letter in id_to_letter.items():
-            sg_mask = hsg_id == hsg_code
+        lc_mask = (lulc_arr == lc_val)
+        for hid, hletter in id_to_letter.items():
+            sg_mask = (hsg_id == hid)
             mask = lc_mask & sg_mask
             if not np.any(mask):
                 continue
-            cn_val = cn_table[category][hsg_letter]
+            cn_val = cn_table[cat][hletter]
             cn[mask] = cn_val
 
-    profile.update(dtype="float32", nodata=cn_nodata)
-    return cn, lulc, hsg_id, profile, sorted(set(unknown_lulc_codes))
+    # CN profile
+    cn_profile = profile.copy()
+    cn_profile.update(dtype="float32", nodata=cn_nodata)
 
+    # Retention S (mm) using SI units: S = (25400 / CN) - 254
+    S_nodata = -9999.0
+    S = np.full_like(cn, S_nodata, dtype=np.float32)
+    valid = (cn != cn_nodata) & (cn > 0)
+    S[valid] = (25400.0 / cn[valid]) - 254.0  # mm
 
-def cn_to_geotiff_bytes(cn, profile):
-    """Write CN raster to an in-memory GeoTIFF and return as BytesIO."""
-    with rasterio.io.MemoryFile() as memfile:
+    S_profile = profile.copy()
+    S_profile.update(dtype="float32", nodata=S_nodata)
+
+    return hsg_id, cn, cn_profile, S, S_profile, sorted(set(unknown_codes))
+
+def array_to_geotiff_bytes(arr, profile):
+    with MemoryFile() as memfile:
         with memfile.open(**profile) as ds:
-            ds.write(cn, 1)
+            ds.write(arr, 1)
         data = memfile.read()
     return BytesIO(data)
 
-
-def plot_raster(arr, title, cbar_label=None):
-    """Return a matplotlib Figure for a 2D raster."""
+def plot_raster(arr, title, cbar_label=None, vmin=None, vmax=None, ticks=None, ticklabels=None):
     fig, ax = plt.subplots(figsize=(5, 4))
-    im = ax.imshow(arr, interpolation="nearest")
+    im = ax.imshow(arr, interpolation="nearest", vmin=vmin, vmax=vmax)
     ax.set_title(title)
     ax.axis("off")
     cbar = fig.colorbar(im, ax=ax)
     if cbar_label:
         cbar.set_label(cbar_label)
+    if ticks is not None and ticklabels is not None:
+        cbar.set_ticks(ticks)
+        cbar.set_ticklabels(ticklabels)
     fig.tight_layout()
     return fig
 
-# -------------------------------------------------------------------
+# -------------------------------------------------------
 # 4. Main workflow
-# -------------------------------------------------------------------
-if soil_file and lulc_file:
-    if st.button("Generate Curve Number Map"):
-        with st.spinner("Processing rasters and generating CN map..."):
+# -------------------------------------------------------
+if soil_file and lulc_file and shp_zip:
+    if st.button("Generate CN & Retention Maps"):
+        with st.spinner("Processing..."):
 
+            # Save inputs to temp
             soil_path_tmp = save_to_temp(soil_file)
             lulc_path_tmp = save_to_temp(lulc_file)
+            shp_zip_path = save_zip(shp_zip)
 
-            soil_reproj, soil_nodata, ref_profile = reproject_soil_to_lulc(
+            # Read boundary geometries from zipped shapefile
+            with fiona.open(f"zip://{shp_zip_path}") as shp:
+                shapes = [feat["geometry"] for feat in shp]
+
+            # Reproject soil to full LULC grid
+            soil_full, soil_nodata, lulc_profile_full = reproject_soil_to_lulc(
                 soil_path_tmp, lulc_path_tmp
             )
 
-            cn, lulc, hsg_id, profile, unknown_codes = compute_cn(
-                soil_reproj, soil_nodata, lulc_path_tmp
+            # Clip LULC to boundary
+            with rasterio.open(lulc_path_tmp) as lulc_src:
+                lulc_clipped, lulc_transform = mask(
+                    lulc_src, shapes, crop=True, filled=True
+                )
+                lulc_clipped = lulc_clipped[0]
+                profile_clip = lulc_src.profile
+                profile_clip.update(
+                    transform=lulc_transform,
+                    height=lulc_clipped.shape[0],
+                    width=lulc_clipped.shape[1],
+                )
+
+            # Clip soil (reprojected) to same boundary using in-memory dataset
+            soil_profile_full = lulc_profile_full.copy()
+            soil_profile_full.update(
+                dtype=soil_full.dtype,
+                nodata=soil_nodata
+            )
+            with MemoryFile() as mem:
+                with mem.open(**soil_profile_full) as soil_ds:
+                    soil_ds.write(soil_full, 1)
+                    soil_clipped, _ = mask(
+                        soil_ds, shapes, crop=True, filled=True
+                    )
+                    soil_clipped = soil_clipped[0]
+
+            # Compute HSG, CN, S (mm)
+            hsg_id, cn, cn_profile, S, S_profile, unknown_codes = compute_cn_and_retention(
+                soil_clipped, soil_nodata, lulc_clipped, profile_clip
             )
 
         if unknown_codes:
             st.warning(
-                f"These CCI LULC codes were not mapped and remain NoData in CN: {unknown_codes}"
+                f"These CCI LULC codes were not mapped to categories and remain NoData in CN: {unknown_codes}"
             )
 
-        # ----------------- Show maps -----------------
-        st.subheader("Maps")
+        st.subheader("Maps (Clipped to Boundary)")
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
+        col3, col4 = st.columns(2)
+
+        # LULC categories map
+        lulc_cat_arr, cat_to_id = classify_lulc_categories(lulc_clipped)
+        cat_ids = list(cat_to_id.values())
+        cat_names = list(cat_to_id.keys())
 
         with col1:
-            st.markdown("**Hydrologic Soil Group (HSG)**  \n1=A, 2=B, 3=C, 4=D")
-            fig_hsg = plot_raster(hsg_id, "HSG", "HSG ID")
-            st.pyplot(fig_hsg)
-
-        with col2:
-            st.markdown("**LULC (CCI Codes)**")
-            fig_lulc = plot_raster(lulc, "LULC", "CCI code")
+            st.markdown("**LULC Map (by category name)**")
+            fig_lulc = plot_raster(
+                lulc_cat_arr,
+                "LULC categories",
+                cbar_label="Category",
+                ticks=cat_ids,
+                ticklabels=cat_names,
+            )
             st.pyplot(fig_lulc)
 
+        # HSG map
+        with col2:
+            st.markdown("**Hydrologic Soil Group (HSG)**")
+            hsg_ticks = [1, 2, 3, 4]
+            hsg_labels = ["A", "B", "C", "D"]
+            fig_hsg = plot_raster(
+                hsg_id,
+                "HSG",
+                cbar_label="HSG",
+                ticks=hsg_ticks,
+                ticklabels=hsg_labels,
+            )
+            st.pyplot(fig_hsg)
+
+        # CN map: fix legend range 60–100
         with col3:
             st.markdown("**Curve Number (CN)**")
-            fig_cn = plot_raster(cn, "Curve Number", "CN")
+            fig_cn = plot_raster(
+                cn,
+                "Curve Number",
+                cbar_label="CN",
+                vmin=60,
+                vmax=100,
+            )
             st.pyplot(fig_cn)
 
-        # ----------------- Download CN GeoTIFF -----------------
-        st.subheader("Download Curve Number GeoTIFF")
+        # Retention map (mm)
+        with col4:
+            st.markdown("**Potential Maximum Retention S (mm)**")
+            fig_S = plot_raster(
+                S,
+                "Retention S (mm)",
+                cbar_label="S (mm)",
+            )
+            st.pyplot(fig_S)
 
-        cn_bytes = cn_to_geotiff_bytes(cn, profile)
+        # ---------------------------------------------------
+        # Download CN & Retention GeoTIFFs
+        # ---------------------------------------------------
+        st.subheader("Download Outputs (GeoTIFF)")
+
+        cn_bytes = array_to_geotiff_bytes(cn, cn_profile)
         st.download_button(
             label="Download CN GeoTIFF",
             data=cn_bytes,
@@ -283,11 +378,21 @@ if soil_file and lulc_file:
             mime="image/tiff",
         )
 
+        S_bytes = array_to_geotiff_bytes(S, S_profile)
+        st.download_button(
+            label="Download Retention S (mm) GeoTIFF",
+            data=S_bytes,
+            file_name="Retention_S_mm.tif",
+            mime="image/tiff",
+        )
+
         # Clean temp files
         try:
             os.remove(soil_path_tmp)
             os.remove(lulc_path_tmp)
+            os.remove(shp_zip_path)
         except Exception:
             pass
+
 else:
-    st.info("Please upload both a SOIL raster and a LULC raster to enable CN generation.")
+    st.info("Please upload SOIL raster, LULC raster, and zipped shapefile to enable processing.")
