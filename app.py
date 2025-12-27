@@ -1,14 +1,13 @@
 import streamlit as st
 import rasterio
 from rasterio.warp import reproject, Resampling
-from rasterio.mask import mask
 from rasterio.io import MemoryFile
 import numpy as np
 import matplotlib.pyplot as plt
 import tempfile
 import os
 from io import BytesIO
-import fiona
+import re
 
 st.set_page_config(page_title="SCS Curve Number & Retention App", layout="wide")
 
@@ -17,12 +16,12 @@ st.title("SCS Curve Number (TR-55) & Retention Map Generator")
 st.write(
     """
     This app:
-    1. Clips rasters to a **boundary shapefile** (zipped folder),
-    2. Converts **OpenLandMap soil texture** → Hydrologic Soil Groups (HSG A–D),
-    3. Converts **ESA CCI Land Cover** → land-use categories,
+    1. Reads **OpenLandMap soil texture** and **ESA CCI LULC** rasters,
+    2. Converts soil texture → Hydrologic Soil Group (HSG A–D),
+    3. Converts CCI LULC → land-use categories,
     4. Computes **Curve Number (CN)** using TR-55 (AMC-II),
-    5. Computes **Potential Maximum Retention** S (in **mm**, SI units),
-    6. Generates maps and downloadable GeoTIFFs.
+    5. Computes **Potential Maximum Retention** S (mm, SI units),
+    6. Names the maps using the **LULC filename** (e.g., LULC 1999 → CN 1999, Retention 1999).
     """
 )
 
@@ -34,19 +33,15 @@ soil_file = st.file_uploader(
     type=["tif", "tiff"],
 )
 lulc_file = st.file_uploader(
-    "Upload LULC raster (GeoTIFF, ESA CCI Land Cover)",
+    "Upload LULC raster (GeoTIFF, ESA CCI Land Cover, e.g., LULC_1999.tif)",
     type=["tif", "tiff"],
-)
-shp_zip = st.file_uploader(
-    "Upload boundary shapefile as a ZIPPED folder (.zip)",
-    type=["zip"],
 )
 
 # -------------------------------------------------------
 # 2. Mappings
 # -------------------------------------------------------
 
-# OpenLandMap soil texture → Hydrologic Soil Group
+# OpenLandMap soil texture → Hydrologic Soil Group (HSG)
 soil_to_hsg = {
     12: "A",  # Sand
     11: "A",  # Loamy sand
@@ -113,7 +108,7 @@ cci_to_category = {
     190:"urban",
 }
 
-# TR-55 CN table (AMC-II) – SI units for retention (mm)
+# TR-55 CN table (AMC-II) – retention in SI units (mm) via formula
 cn_table = {
     "cropland":        {"A": 64, "B": 75, "C": 82, "D": 85},  # Row crops (good)
     "mosaic_cropland": {"A": 60, "B": 72, "C": 80, "D": 84},  # Small grain (good)
@@ -135,15 +130,8 @@ def save_to_temp(uploaded_file, suffix=".tif"):
     tmp.close()
     return tmp.name
 
-def save_zip(uploaded_file):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-    tmp.write(uploaded_file.read())
-    tmp.flush()
-    tmp.close()
-    return tmp.name
-
 def reproject_soil_to_lulc(soil_path, lulc_path):
-    """Reproject soil raster to full LULC grid."""
+    """Reproject soil raster to the grid (extent/resolution/CRS) of the LULC raster."""
     with rasterio.open(soil_path) as soil_src, rasterio.open(lulc_path) as lulc_src:
         soil = soil_src.read(1)
         soil_nodata = soil_src.nodata if soil_src.nodata is not None else 0
@@ -214,11 +202,10 @@ def compute_cn_and_retention(soil_arr, soil_nodata, lulc_arr, profile):
             cn_val = cn_table[cat][hletter]
             cn[mask] = cn_val
 
-    # CN profile
     cn_profile = profile.copy()
     cn_profile.update(dtype="float32", nodata=cn_nodata)
 
-    # Retention S (mm) using SI units: S = (25400 / CN) - 254
+    # Retention S (mm), SI: S = (25400 / CN) - 254
     S_nodata = -9999.0
     S = np.full_like(cn, S_nodata, dtype=np.float32)
     valid = (cn != cn_nodata) & (cn > 0)
@@ -236,7 +223,8 @@ def array_to_geotiff_bytes(arr, profile):
         data = memfile.read()
     return BytesIO(data)
 
-def plot_raster(arr, title, cbar_label=None, vmin=None, vmax=None, ticks=None, ticklabels=None):
+def plot_raster(arr, title, cbar_label=None, vmin=None, vmax=None,
+                ticks=None, ticklabels=None):
     fig, ax = plt.subplots(figsize=(5, 4))
     im = ax.imshow(arr, interpolation="nearest", vmin=vmin, vmax=vmax)
     ax.set_title(title)
@@ -250,57 +238,42 @@ def plot_raster(arr, title, cbar_label=None, vmin=None, vmax=None, ticks=None, t
     fig.tight_layout()
     return fig
 
+def infer_year_from_filename(filename: str) -> str:
+    """Extract a 4-digit year from filename, else return generic label."""
+    match = re.search(r"(19|20)\d{2}", filename)
+    if match:
+        return match.group(0)
+    else:
+        return "LULC"
+
 # -------------------------------------------------------
 # 4. Main workflow
 # -------------------------------------------------------
-if soil_file and lulc_file and shp_zip:
+if soil_file and lulc_file:
     if st.button("Generate CN & Retention Maps"):
         with st.spinner("Processing..."):
+
+            # Infer "year" from LULC filename
+            lulc_name = lulc_file.name
+            year_label = infer_year_from_filename(lulc_name)
 
             # Save inputs to temp
             soil_path_tmp = save_to_temp(soil_file)
             lulc_path_tmp = save_to_temp(lulc_file)
-            shp_zip_path = save_zip(shp_zip)
 
-            # Read boundary geometries from zipped shapefile
-            with fiona.open(f"zip://{shp_zip_path}") as shp:
-                shapes = [feat["geometry"] for feat in shp]
-
-            # Reproject soil to full LULC grid
-            soil_full, soil_nodata, lulc_profile_full = reproject_soil_to_lulc(
+            # Reproject soil to LULC grid
+            soil_reproj, soil_nodata, lulc_profile = reproject_soil_to_lulc(
                 soil_path_tmp, lulc_path_tmp
             )
 
-            # Clip LULC to boundary
+            # Read full LULC
             with rasterio.open(lulc_path_tmp) as lulc_src:
-                lulc_clipped, lulc_transform = mask(
-                    lulc_src, shapes, crop=True, filled=True
-                )
-                lulc_clipped = lulc_clipped[0]
-                profile_clip = lulc_src.profile
-                profile_clip.update(
-                    transform=lulc_transform,
-                    height=lulc_clipped.shape[0],
-                    width=lulc_clipped.shape[1],
-                )
+                lulc_full = lulc_src.read(1)
+                profile = lulc_src.profile
 
-            # Clip soil (reprojected) to same boundary using in-memory dataset
-            soil_profile_full = lulc_profile_full.copy()
-            soil_profile_full.update(
-                dtype=soil_full.dtype,
-                nodata=soil_nodata
-            )
-            with MemoryFile() as mem:
-                with mem.open(**soil_profile_full) as soil_ds:
-                    soil_ds.write(soil_full, 1)
-                    soil_clipped, _ = mask(
-                        soil_ds, shapes, crop=True, filled=True
-                    )
-                    soil_clipped = soil_clipped[0]
-
-            # Compute HSG, CN, S (mm)
+            # Compute HSG, CN, S
             hsg_id, cn, cn_profile, S, S_profile, unknown_codes = compute_cn_and_retention(
-                soil_clipped, soil_nodata, lulc_clipped, profile_clip
+                soil_reproj, soil_nodata, lulc_full, profile
             )
 
         if unknown_codes:
@@ -308,21 +281,21 @@ if soil_file and lulc_file and shp_zip:
                 f"These CCI LULC codes were not mapped to categories and remain NoData in CN: {unknown_codes}"
             )
 
-        st.subheader("Maps (Clipped to Boundary)")
+        st.subheader(f"Maps for {year_label}")
 
         col1, col2 = st.columns(2)
         col3, col4 = st.columns(2)
 
-        # LULC categories map
-        lulc_cat_arr, cat_to_id = classify_lulc_categories(lulc_clipped)
+        # LULC categories map (names as legend)
+        lulc_cat_arr, cat_to_id = classify_lulc_categories(lulc_full)
         cat_ids = list(cat_to_id.values())
         cat_names = list(cat_to_id.keys())
 
         with col1:
-            st.markdown("**LULC Map (by category name)**")
+            st.markdown(f"**LULC Map ({year_label}) – Category Names**")
             fig_lulc = plot_raster(
                 lulc_cat_arr,
-                "LULC categories",
+                f"LULC {year_label}",
                 cbar_label="Category",
                 ticks=cat_ids,
                 ticklabels=cat_names,
@@ -343,12 +316,12 @@ if soil_file and lulc_file and shp_zip:
             )
             st.pyplot(fig_hsg)
 
-        # CN map: fix legend range 60–100
+        # CN map: legend fixed 60–100
         with col3:
-            st.markdown("**Curve Number (CN)**")
+            st.markdown(f"**Curve Number (CN) – {year_label}**")
             fig_cn = plot_raster(
                 cn,
-                "Curve Number",
+                f"Curve Number {year_label}",
                 cbar_label="CN",
                 vmin=60,
                 vmax=100,
@@ -357,32 +330,30 @@ if soil_file and lulc_file and shp_zip:
 
         # Retention map (mm)
         with col4:
-            st.markdown("**Potential Maximum Retention S (mm)**")
+            st.markdown(f"**Potential Maximum Retention S (mm) – {year_label}**")
             fig_S = plot_raster(
                 S,
-                "Retention S (mm)",
+                f"Retention S (mm) {year_label}",
                 cbar_label="S (mm)",
             )
             st.pyplot(fig_S)
 
-        # ---------------------------------------------------
-        # Download CN & Retention GeoTIFFs
-        # ---------------------------------------------------
+        # Downloads
         st.subheader("Download Outputs (GeoTIFF)")
 
         cn_bytes = array_to_geotiff_bytes(cn, cn_profile)
         st.download_button(
-            label="Download CN GeoTIFF",
+            label=f"Download CN GeoTIFF ({year_label})",
             data=cn_bytes,
-            file_name="CurveNumber.tif",
+            file_name=f"CurveNumber_{year_label}.tif",
             mime="image/tiff",
         )
 
         S_bytes = array_to_geotiff_bytes(S, S_profile)
         st.download_button(
-            label="Download Retention S (mm) GeoTIFF",
+            label=f"Download Retention S (mm) GeoTIFF ({year_label})",
             data=S_bytes,
-            file_name="Retention_S_mm.tif",
+            file_name=f"Retention_S_mm_{year_label}.tif",
             mime="image/tiff",
         )
 
@@ -390,9 +361,8 @@ if soil_file and lulc_file and shp_zip:
         try:
             os.remove(soil_path_tmp)
             os.remove(lulc_path_tmp)
-            os.remove(shp_zip_path)
         except Exception:
             pass
 
 else:
-    st.info("Please upload SOIL raster, LULC raster, and zipped shapefile to enable processing.")
+    st.info("Please upload both a SOIL raster and a LULC raster to enable processing.")
