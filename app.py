@@ -114,17 +114,19 @@ cci_to_category = {
     190: "urban",
 }
 
-# CN look-up table (AMC-II). Adjust to your preferred values if needed.
+
+# CN lookup table (AMC-II) from TR-55 tables
 cn_table = {
-    "cropland":        {"A": 67, "B": 78, "C": 85, "D": 89},
-    "mosaic_cropland": {"A": 69, "B": 80, "C": 86, "D": 90},
-    "grassland":       {"A": 39, "B": 61, "C": 74, "D": 80},
-    "shrubland":       {"A": 35, "B": 56, "C": 70, "D": 77},
-    "forest":          {"A": 30, "B": 55, "C": 70, "D": 77},
-    "barren":          {"A": 77, "B": 86, "C": 91, "D": 94},
-    "urban":           {"A": 77, "B": 85, "C": 90, "D": 92},
-    "water":           {"A": 100, "B": 100, "C": 100, "D": 100},
+    "cropland":        {"A": 64, "B": 75, "C": 82, "D": 85},  # Row crops (good)
+    "mosaic_cropland": {"A": 60, "B": 72, "C": 80, "D": 84},  # Small grain (good)
+    "grassland":       {"A": 39, "B": 61, "C": 74, "D": 80},  # Pasture/grassland good
+    "shrubland":       {"A": 35, "B": 56, "C": 70, "D": 77},  # Brush fair
+    "forest":          {"A": 30, "B": 55, "C": 70, "D": 77},  # Woods good
+    "barren":          {"A": 72, "B": 82, "C": 87, "D": 89},  # Dirt (right-of-way)
+    "urban":           {"A": 98, "B": 98, "C": 98, "D": 98},  # Paved/roofs
+    "water":           {"A": 100, "B": 100, "C": 100, "D": 100},  # Open water
 }
+
 
 # -------------------------------------------------------------------
 # 3. Helper functions
