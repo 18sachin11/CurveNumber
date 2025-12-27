@@ -50,6 +50,46 @@ season_type = st.selectbox(
     options=["Growing season", "Dormant season"],
     index=0
 )
+# ---- 1. Read rainfall CSV and enforce 1 year ----
+df_rain = pd.read_csv(rain_csv_file)
+
+# Normalize column names (lowercase, strip spaces)
+df_rain.columns = [c.strip().lower() for c in df_rain.columns]
+
+if "date" not in df_rain.columns or "rain_mm" not in df_rain.columns:
+    st.error(
+        "Rainfall CSV must have columns named 'date' and 'rain_mm' "
+        "(case-insensitive). Current columns: "
+        f"{list(df_rain.columns)}"
+    )
+    st.stop()
+
+# Try to parse dates safely
+df_rain["date"] = pd.to_datetime(
+    df_rain["date"],
+    errors="coerce",          # non-parsable → NaT
+    infer_datetime_format=True,
+    dayfirst=True,            # handles DD/MM/YYYY or DD-MM-YYYY
+)
+
+# Check if any dates failed to parse
+if df_rain["date"].isna().any():
+    bad_rows = df_rain[df_rain["date"].isna()]
+    st.error(
+        "Some rows in the 'date' column could not be parsed as dates. "
+        "Please check the format (e.g., use YYYY-MM-DD or DD/MM/YYYY). "
+        f"Example problematic entries:\n{bad_rows.head().to_string(index=False)}"
+    )
+    st.stop()
+
+years = df_rain["date"].dt.year.unique()
+if len(years) != 1:
+    st.error(
+        f"Rainfall CSV must contain data for exactly 1 year. Found years: {years}"
+    )
+    st.stop()
+
+year_label = str(years[0])
 
 # -------------------------------------------------------
 # 2. Mappings (Soil, LULC, CN-II)
