@@ -4,6 +4,7 @@ from rasterio.warp import reproject, Resampling
 from rasterio.io import MemoryFile
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import tempfile
 import os
 from io import BytesIO
@@ -24,7 +25,8 @@ st.write(
     4. Reads a **daily rainfall CSV for exactly 1 year**,
     5. Uses **5-day antecedent rainfall** to assign **AMC-I / AMC-II / AMC-III** per day,
     6. Computes **daily runoff (mm)** maps and a **runoff time-series**,
-    7. Finds the **day of maximum mean runoff** and shows its runoff map.
+    7. Finds the **day of maximum mean runoff** and shows its runoff map,
+    8. Lets you **download CN, S, and max-runoff GeoTIFFs**.
 
     All quantities are in **SI units (mm)**. The analysis is strictly for **one year**.
     """
@@ -134,6 +136,18 @@ cn_table_ii = {
     "barren":          {"A": 72, "B": 82, "C": 87, "D": 89},  # Dirt / bare
     "urban":           {"A": 98, "B": 98, "C": 98, "D": 98},  # Fully paved
     "water":           {"A":100, "B":100, "C":100, "D":100},  # Open water
+}
+
+# Colour palette for LULC categories (approximate ESA-CCI-like colours)
+lulc_category_colors = {
+    "cropland":        "#ffff64",  # yellow
+    "mosaic_cropland": "#ffd37f",  # orange-yellow
+    "forest":          "#006400",  # dark green
+    "grassland":       "#a1d99b",  # light green
+    "shrubland":       "#d95f0e",  # orange
+    "barren":          "#bdbdbd",  # grey
+    "urban":           "#ff0000",  # red
+    "water":           "#0000ff",  # blue
 }
 
 # =======================================================
@@ -246,7 +260,7 @@ def array_to_geotiff_bytes(arr, profile):
 
 def plot_raster(arr, title, cbar_label=None, vmin=None, vmax=None,
                 ticks=None, ticklabels=None):
-    """Make a simple imshow plot with optional discrete colorbar ticks."""
+    """Generic imshow plot with optional colorbar."""
     fig, ax = plt.subplots(figsize=(5, 4))
     im = ax.imshow(arr, interpolation="nearest", vmin=vmin, vmax=vmax)
     ax.set_title(title)
@@ -279,14 +293,52 @@ def classify_lulc_categories(lulc_arr):
         cat_arr[mask] = cat_to_id[cat]
     return cat_arr, cat_to_id
 
+def plot_lulc_with_legend(cat_arr, cat_to_id, title):
+    """
+    Plot LULC categories using fixed colours (approx. ESA-CCI legend)
+    and show a legend with category names.
+    """
+    id_to_cat = {v: k for k, v in cat_to_id.items()}
+    h, w = cat_arr.shape
+    rgb = np.ones((h, w, 3), dtype=np.float32)  # default white
+
+    for cid, cat in id_to_cat.items():
+        if cat not in lulc_category_colors:
+            continue
+        hex_color = lulc_category_colors[cat]
+        # convert hex to RGB (0-1)
+        hex_color = hex_color.lstrip("#")
+        r = int(hex_color[0:2], 16) / 255.0
+        g = int(hex_color[2:4], 16) / 255.0
+        b = int(hex_color[4:6], 16) / 255.0
+        mask = (cat_arr == cid)
+        rgb[mask] = [r, g, b]
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.imshow(rgb, interpolation="nearest")
+    ax.set_title(title)
+    ax.axis("off")
+
+    # Legend patches
+    patches = []
+    for cat, cid in cat_to_id.items():
+        if cat not in lulc_category_colors:
+            continue
+        patches.append(
+            mpatches.Patch(color=lulc_category_colors[cat], label=cat)
+        )
+    if patches:
+        ax.legend(handles=patches, bbox_to_anchor=(1.05, 1), loc="upper left", borderaxespad=0.)
+
+    fig.tight_layout()
+    return fig
+
 def classify_amc_series(df: pd.DataFrame, season_type: str) -> pd.DataFrame:
     """
     Assign AMC-I/II/III based on 5-day antecedent rainfall (SCS).
     df has columns 'date' (datetime) and 'rain_mm'.
     """
     df = df.sort_values("date").reset_index(drop=True)
-
-    # 5-day antecedent rainfall sum
     p5 = df["rain_mm"].rolling(window=5, min_periods=5).sum()
 
     if "Growing" in season_type:
@@ -308,12 +360,10 @@ def compute_runoff_q(P, S, S_nodata):
     Q = np.zeros_like(S, dtype=np.float32)
     mask_valid = (S != S_nodata) & (S > 0) & (P > 0.0)
 
-    # SCS-CN formula where P > 0.2S
     cond = mask_valid & (P > 0.2 * S)
     num = (P - 0.2 * S)**2
     den = P + 0.8 * S
     Q[cond] = num[cond] / den[cond]
-    # where P <= 0.2S, Q stays 0
     return Q
 
 # =======================================================
@@ -323,13 +373,9 @@ if soil_file and lulc_file and rain_csv_file:
     if st.button("Run Single-Year CN–Retention–Runoff Analysis"):
         with st.spinner("Processing..."):
 
-            # ---------------- Rainfall CSV: robust reading ----------------
+            # --------- Rainfall CSV: robust reading ----------
             csv_path = save_csv_to_temp(rain_csv_file)
-
-            # Read with BOM-handling
             df_rain = pd.read_csv(csv_path, encoding="utf-8-sig")
-
-            # Normalize column names
             df_rain.columns = [c.strip().lower() for c in df_rain.columns]
 
             if "date" not in df_rain.columns or "rain_mm" not in df_rain.columns:
@@ -339,7 +385,6 @@ if soil_file and lulc_file and rain_csv_file:
                 )
                 st.stop()
 
-            # Parse dates; your example is DD-MM-YYYY, so use dayfirst=True
             df_rain["date"] = pd.to_datetime(
                 df_rain["date"],
                 errors="coerce",
@@ -347,7 +392,6 @@ if soil_file and lulc_file and rain_csv_file:
                 infer_datetime_format=True,
             )
 
-            # Check for bad dates
             if df_rain["date"].isna().any():
                 bad_rows = df_rain[df_rain["date"].isna()]
                 st.error(
@@ -367,10 +411,10 @@ if soil_file and lulc_file and rain_csv_file:
 
             year_label = str(years[0])
 
-            # AMC classification per day using 5-day antecedent rainfall
+            # AMC classification
             df_rain = classify_amc_series(df_rain, season_type)
 
-            # ---------------- SOIL & LULC processing ----------------
+            # --------- SOIL & LULC processing ----------
             soil_path_tmp = save_tif_to_temp(soil_file)
             lulc_path_tmp = save_tif_to_temp(lulc_file)
 
@@ -382,20 +426,19 @@ if soil_file and lulc_file and rain_csv_file:
                 lulc_arr = lulc_src.read(1)
                 profile = lulc_src.profile
 
-            # Compute CN-II
+            # CN-II
             hsg_id, cn_ii, cn_profile, unknown_codes = compute_cn_ii(
                 soil_reproj, soil_nodata, lulc_arr, profile
             )
 
-            # Pre-compute CN-I and CN-III grids
+            # CN-I & CN-III
             cn_i, cn_iii = adjust_cn_for_amc_from_cn_ii(cn_ii)
 
-            # Retention S-II (mm) from CN-II (for base map)
+            # Retention S-II from CN-II (for base map)
             S_ii, S_nodata = compute_S_from_CN(cn_ii)
             S_profile = cn_profile.copy()
             S_profile.update(dtype="float32", nodata=S_nodata)
 
-        # Warn if some CCI codes not mapped
         if unknown_codes:
             st.warning(
                 f"These CCI LULC codes were not mapped and remain NoData in CN: {unknown_codes}"
@@ -406,19 +449,15 @@ if soil_file and lulc_file and rain_csv_file:
 
         col1, col2 = st.columns(2)
 
-        # LULC categories (names in legend)
+        # LULC categories with actual legend colours
         lulc_cat_arr, cat_to_id = classify_lulc_categories(lulc_arr)
-        cat_ids = list(cat_to_id.values())
-        cat_names = list(cat_to_id.keys())
 
         with col1:
-            st.markdown("**LULC (categories)**")
-            fig_lulc = plot_raster(
+            st.markdown("**LULC (with legend colours)**")
+            fig_lulc = plot_lulc_with_legend(
                 lulc_cat_arr,
-                f"LULC Categories ({year_label})",
-                cbar_label="Category",
-                ticks=cat_ids,
-                ticklabels=cat_names,
+                cat_to_id,
+                f"LULC Categories ({year_label})"
             )
             st.pyplot(fig_lulc)
 
@@ -472,7 +511,6 @@ if soil_file and lulc_file and rain_csv_file:
             P = row["rain_mm"]
             AMC = row["AMC"]
 
-            # Choose appropriate CN grid for this day
             if AMC == "I":
                 cn_day = cn_i
             elif AMC == "III":
@@ -520,8 +558,9 @@ if soil_file and lulc_file and rain_csv_file:
         st.pyplot(fig_Qmax)
 
         # ---------------- DOWNLOADS ----------------
-        st.subheader("Download CN-II & Retention S-II GeoTIFFs (Single Year)")
+        st.subheader("Download GeoTIFFs (Single Year)")
 
+        # CN-II
         cn_bytes = array_to_geotiff_bytes(cn_ii, cn_profile)
         st.download_button(
             label=f"Download CN-II GeoTIFF ({year_label})",
@@ -530,11 +569,23 @@ if soil_file and lulc_file and rain_csv_file:
             mime="image/tiff",
         )
 
+        # S-II
         S_bytes = array_to_geotiff_bytes(S_ii, S_profile)
         st.download_button(
             label=f"Download Retention S-II (mm) GeoTIFF ({year_label})",
             data=S_bytes,
             file_name=f"Retention_SII_mm_{year_label}.tif",
+            mime="image/tiff",
+        )
+
+        # Max runoff day GeoTIFF
+        maxQ_profile = profile.copy()
+        maxQ_profile.update(dtype="float32", nodata=0.0)
+        maxQ_bytes = array_to_geotiff_bytes(max_runoff_grid, maxQ_profile)
+        st.download_button(
+            label=f"Download Max Runoff GeoTIFF ({max_runoff_date.date()})",
+            data=maxQ_bytes,
+            file_name=f"MaxRunoff_{year_label}_{max_runoff_date.date()}.tif",
             mime="image/tiff",
         )
 
